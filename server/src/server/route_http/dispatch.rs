@@ -9,7 +9,7 @@ use serde_json::{json, Value};
 use std::sync::Arc;
 
 use crate::{
-    auth::{bearer_token, is_authorized_client_headers, is_authorized_headers},
+    auth::{bearer_token, hash_device_api_token, is_authorized_headers},
     connected_computers::{authorize_peer_token, PeerAuthorization},
     extensions::serve_extension_static,
     protocol::{
@@ -264,12 +264,14 @@ pub(in crate::server) async fn route_http(
         }
         _ => {}
     }
+    // Whether a paired phone's own token authorised this request is settled here, before the
+    // body is read: a phone removed while its body arrives must not pass as the main token later.
+    let caller_token_hash = bearer_token(&parts.headers)
+        .filter(|token| state.device_api_tokens.accepts(token))
+        .map(hash_device_api_token);
     if endpoint.requires_auth
-        && !is_authorized_client_headers(
-            &parts.headers,
-            &state.auth_token,
-            &state.device_api_tokens,
-        )
+        && !is_authorized_headers(&parts.headers, &state.auth_token)
+        && caller_token_hash.is_none()
         && token_extension_id.is_none()
         && peer.is_none()
     {
@@ -349,7 +351,7 @@ pub(in crate::server) async fn route_http(
         );
     }
 
-    // The exchange needs to know which computer's token asked, which no area handler sees.
+    // These two need to know whose token asked, which no area handler sees.
     if endpoint.path == crate::settings_sync::EXCHANGE_ENDPOINT {
         let peer_server_id = match &peer {
             Some(PeerAuthorization::Allowed { server_id, .. }) => Some(server_id.clone()),
@@ -360,6 +362,16 @@ pub(in crate::server) async fn route_http(
             peer_server_id,
             body_json,
             request_id,
+        )
+        .await;
+    }
+    if endpoint.path == crate::push::REGISTER_PUSH_TOKEN_ENDPOINT {
+        return crate::push::handle_register_push_token_http(
+            &state,
+            endpoint.path,
+            request_id,
+            &body_json,
+            caller_token_hash,
         )
         .await;
     }

@@ -53,24 +53,29 @@ pub(crate) fn is_printable_id(value: &str, max: usize) -> bool {
     (1..=max).contains(&value.len()) && value.bytes().all(|byte| (0x21..=0x7e).contains(&byte))
 }
 
+/// `caller_token_hash` is the SHA-256 of the paired phone's own API token when the request
+/// authenticated with one, and `None` for the computer's main token.
 pub(crate) async fn handle_register_push_token_http(
     state: &AppState,
     endpoint_path: String,
     request_id: String,
     body: &Value,
+    caller_token_hash: Option<String>,
 ) -> RoutedResponse {
     let request = match parse_push_token_request(body) {
         Ok(request) => request,
         Err(error) => return error.into_response(endpoint_path, request_id),
     };
     let paths = state.paths.clone();
-    let outcome = tokio::task::spawn_blocking(move || apply_push_token_request(&paths, request))
-        .await
-        .unwrap_or_else(|_| {
-            Err(PushTokenError::internal(
-                "The push registration task stopped before it finished.",
-            ))
-        });
+    let outcome = tokio::task::spawn_blocking(move || {
+        apply_push_token_request(&paths, request, caller_token_hash.as_deref())
+    })
+    .await
+    .unwrap_or_else(|_| {
+        Err(PushTokenError::internal(
+            "The push registration task stopped before it finished.",
+        ))
+    });
     match outcome {
         Ok(()) => routed_json(
             Some(endpoint_path),
@@ -164,12 +169,16 @@ fn read_machine_id(params: &Map<String, Value>) -> Result<String, PushTokenError
 }
 
 /// CDXC:Notifications 2026-10-31 WHY:
-/// The shared bearer token is the only credential on this route, so the computer id and device id a phone sends are names, not proof of which phone is asking. A registration therefore never takes over what another binding holds: a token or a paired device already registered under another computer id is refused, and a computer id keeps the paired device it was registered with until it is unregistered. The phone unregisters and registers again to change either.
+/// The computer id and device id a phone sends are names, not proof of which phone is asking. A registration therefore never takes over what another binding holds: a token or a paired device already registered under another computer id is refused, and a computer id keeps the paired device it was registered with until it is unregistered. The phone unregisters and registers again to change either.
 /// A device id must name a phone paired with this computer, checked while the store lock is held; unpairing holds the same lock from deleting that phone's registration until its pairing row is gone, so a registration racing an unpair cannot leave a token behind.
 /// SEE-ALSO: server/src/remote_access/paired_devices.rs (unpair deletes the linked registration).
+///
+/// CDXC:Notifications 2026-11-06 WHY:
+/// A request made with a paired phone's own API token (CDXC:RemotePairing 2026-10-25 in `auth.rs`) is proof of which phone asks, so its registration belongs to that phone: an omitted device id is filled with it, and a device id naming another device is refused. Otherwise a paired phone could register under another phone's id, or unlinked, and removing it from Paired devices would leave its token sending. The computer's main token (local callers, phones connected over SSH) names no phone, so those requests keep the device id they send.
 fn apply_push_token_request(
     paths: &GxserverPaths,
     request: PushTokenRequest,
+    caller_token_hash: Option<&str>,
 ) -> Result<(), PushTokenError> {
     let store = PushRegistrationStore::open(paths);
     let mut data = store.read()?;
@@ -188,6 +197,18 @@ fn apply_push_token_request(
             kinds,
             device_id,
         } => {
+            let device_id = match caller_token_hash {
+                None => device_id,
+                Some(caller_token_hash) => {
+                    let caller = caller_device_id(paths, caller_token_hash)?;
+                    if device_id.as_ref().is_some_and(|device_id| *device_id != caller) {
+                        return Err(PushTokenError::bad_request(
+                            "deviceId must name the paired phone this request comes from.",
+                        ));
+                    }
+                    Some(caller)
+                }
+            };
             let existing = registrations
                 .iter()
                 .position(|registration| registration.machine_id == machine_id);
@@ -248,6 +269,24 @@ fn paired_device_exists(paths: &GxserverPaths, device_id: &str) -> Result<bool, 
         .find_device(device_id)
         .map(|device| device.is_some())
         .map_err(unreadable)
+}
+
+/// The paired device whose API token hashes to `token_hash`. The token was accepted when the
+/// request arrived; a phone removed since then is refused like an unknown device id.
+fn caller_device_id(paths: &GxserverPaths, token_hash: &str) -> Result<String, PushTokenError> {
+    let unreadable = |_| PushTokenError::internal("The paired phones could not be read.");
+    let db = open_gxserver_database(paths).map_err(unreadable)?;
+    RemotePairingRepository::new(&db)
+        .list_devices()
+        .map_err(unreadable)?
+        .into_iter()
+        .find(|device| device.api_token_hash.as_deref() == Some(token_hash))
+        .map(|device| device.id)
+        .ok_or_else(|| PushTokenError {
+            status: StatusCode::NOT_FOUND,
+            code: "notFound",
+            message: "This phone is no longer paired with this computer.".to_string(),
+        })
 }
 
 struct PushTokenError {
