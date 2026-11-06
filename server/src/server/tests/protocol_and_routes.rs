@@ -977,6 +977,9 @@ async fn omp_tool_approval_probe_after_http_action(action: OmpApprovalAction) {
         while !stopping.load(Ordering::SeqCst) {
             match listener.accept() {
                 Ok((mut stream, _)) => {
+                    // On macOS an accepted socket inherits the listener's nonblocking mode;
+                    // the request read must wait for the client instead of failing early.
+                    stream.set_nonblocking(false).expect("blocking capture stream");
                     stream
                         .set_read_timeout(Some(std::time::Duration::from_secs(2)))
                         .unwrap();
