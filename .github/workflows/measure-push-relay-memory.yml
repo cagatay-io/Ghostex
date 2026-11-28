@@ -1,0 +1,564 @@
+# Measures ghostex-push-relay's memory on Linux under the unit's memory limit (MemoryMax=128M). It runs only
+# when the branch measure/push-relay-memory is pushed; that branch holds nothing but server/push-relay and this
+# file, so no other workflow exists in the commit that runs. It needs no secret: a throwaway Apple key is made
+# on the runner and pushes go to a stand-in for Apple on loopback that answers every push 400 BadDeviceToken.
+#
+# The log carries counts, status codes, memory figures and fixed relay log classes; never a key, token, id or
+# path of this runner's files. Expected runtime: about 45 minutes, most of it filling the two memories of
+# tokens Apple dropped at the relay-wide push rate (3000 a minute per route family).
+name: Measure push relay memory
+
+on:
+  push:
+    branches: [measure/push-relay-memory]
+
+permissions:
+  contents: read
+
+jobs:
+  measure:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    defaults:
+      run:
+        working-directory: server/push-relay
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Build the release binary (static musl, as shipped)
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq musl-tools
+          channel="$(sed -n 's/^channel = "\(.*\)"/\1/p' rust-toolchain.toml)"
+          rustup toolchain install "$channel" --profile minimal --target x86_64-unknown-linux-musl
+          CC_x86_64_unknown_linux_musl=musl-gcc cargo build --release --locked --target x86_64-unknown-linux-musl
+
+      - name: Measure under MemoryMax=128M
+        env:
+          RELAY_BINARY: target/x86_64-unknown-linux-musl/release/ghostex-push-relay
+          MEASURE_CGROUP: "1"
+          MEASURE_TMP: ${{ runner.temp }}
+        shell: python3 -u {0}
+        run: |
+          # MEASURE_CGROUP=1 runs the relay in a systemd scope with MemoryMax=128M and reads the scope's cgroup;
+          # without it the relay runs as a plain child and its RSS is reported (a local check of this script).
+          # MEASURE_DRY_RUN=1 fills the memories of dropped tokens only to a few hundred, not to their caps.
+          import collections, http.client, json, os, re, resource, socket, subprocess, sys, tempfile, threading, time
+
+          CRATE = os.getcwd()
+          BINARY = os.path.abspath(os.environ["RELAY_BINARY"])
+          CGROUP = os.environ.get("MEASURE_CGROUP") == "1"
+          DRY = os.environ.get("MEASURE_DRY_RUN") == "1"
+          PORT, STAND_IN_PORT = 58810, 58811
+          UNIT = "gx-relay-measure"
+          MEMORY_MAX = 128 * 1024 * 1024
+          GONE_DEADLINE = 50 * 60
+
+
+          def say(*parts):
+              print(*parts, flush=True)
+
+
+          def constant(path, pattern):
+              """A number from the relay's source, so the measurement follows the code's limits."""
+              with open(os.path.join(CRATE, path)) as source:
+                  match = re.search(pattern, source.read())
+              if not match:
+                  sys.exit(f"measure: {pattern} not found in {path}")
+              value = 1
+              for factor in match.group(1).split("*"):
+                  value *= int(factor.strip().replace("_", ""))
+              return value
+
+
+          BODY_READS = constant("src/limits.rs", r"pub const BODY_READS: usize = ([\d_]+);")
+          BODY_READ_TIME = constant("src/limits.rs", r"pub const BODY_READ_TIME: Duration = Duration::from_secs\((\d+)\);")
+          PUSH_BODY = constant("src/push_routes.rs", r"pub const MAX_PUSH_BODY_BYTES: usize = ([\d_ *]+);")
+          LA_KEYS = constant("src/limits.rs", r"const MAX_KEYS: usize = ([\d_]+);")
+          LA_GONE = constant("src/limits.rs", r"\bmax_gone_tokens: ([\d_]+),")
+          PUSH_KEYS = constant("src/limits.rs", r"push_max_keys: ([\d_]+),")
+          PUSH_GONE = constant("src/limits.rs", r"push_max_gone_tokens: ([\d_]+),")
+          STORE_ENTRIES = constant("src/limits.rs", r"store_max_entries: ([\d_]+),")
+          STORE_BYTES = constant("src/limits.rs", r"store_max_bytes: ([\d_ *]+),")
+          LA_GONE_TARGET = 400 if DRY else LA_GONE
+          PUSH_GONE_TARGET = 150 if DRY else PUSH_GONE
+
+
+          # A stand-in for Apple: HTTP/2 without TLS on loopback, as the relay's --apple-stand-in speaks it. It reads
+          # no header and answers every request 400 {"reason":"BadDeviceToken"}, so the relay remembers each token
+          # as dropped.
+          def frame(kind, flags, stream, payload=b""):
+              return len(payload).to_bytes(3, "big") + bytes([kind, flags]) + stream.to_bytes(4, "big") + payload
+
+
+          APPLE_ANSWER = json.dumps({"reason": "BadDeviceToken"}).encode()
+
+
+          def apple_answer(stream):
+              # ":status: 400" is entry 12 of HPACK's static table.
+              return frame(1, 0x4, stream, bytes([0x80 | 12])) + frame(0, 0x1, stream, APPLE_ANSWER)
+
+
+          def recv_exact(sock, size):
+              data = b""
+              while len(data) < size:
+                  chunk = sock.recv(size - len(data))
+                  if not chunk:
+                      raise EOFError
+                  data += chunk
+              return data
+
+
+          def stand_in_connection(sock):
+              try:
+                  recv_exact(sock, 24)
+                  sock.sendall(frame(4, 0, 0))
+                  while True:
+                      head = recv_exact(sock, 9)
+                      length, kind, flags = int.from_bytes(head[:3], "big"), head[3], head[4]
+                      stream = int.from_bytes(head[5:9], "big") & 0x7FFFFFFF
+                      payload = recv_exact(sock, length)
+                      out = b""
+                      if kind == 4 and not flags & 0x1:
+                          out = frame(4, 0x1, 0)
+                      elif kind == 6 and not flags & 0x1:
+                          out = frame(6, 0x1, 0, payload)
+                      elif kind == 0:
+                          if length:
+                              out = frame(8, 0, 0, length.to_bytes(4, "big"))
+                          if flags & 0x1:
+                              out += apple_answer(stream)
+                      elif kind == 1 and flags & 0x1:
+                          out = apple_answer(stream)
+                      elif kind == 7:
+                          return
+                      if out:
+                          sock.sendall(out)
+              except (EOFError, OSError):
+                  pass
+              finally:
+                  sock.close()
+
+
+          def stand_in():
+              server = socket.socket()
+              server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+              server.bind(("127.0.0.1", STAND_IN_PORT))
+              server.listen(64)
+
+              def accept():
+                  while True:
+                      sock, _ = server.accept()
+                      threading.Thread(target=stand_in_connection, args=(sock,), daemon=True).start()
+
+              threading.Thread(target=accept, daemon=True).start()
+
+
+          # The relay, in a scope with the unit's memory limit (Linux) or as a plain child (local check).
+          def read(path):
+              try:
+                  with open(path) as file:
+                      return file.read().strip()
+              except OSError:
+                  return ""
+
+
+          def scope_cgroup(kind):
+              command = ["systemctl"] + (["--user"] if kind == "user" else []) + ["show", "-p", "ControlGroup", "--value", f"{UNIT}.scope"]
+              result = subprocess.run(command, capture_output=True, text=True)
+              group = result.stdout.strip()
+              return f"/sys/fs/cgroup{group}" if result.returncode == 0 and group else None
+
+
+          def stop_scope(kind, process):
+              command = (["systemctl", "--user"] if kind == "user" else ["sudo", "systemctl"]) + ["stop", f"{UNIT}.scope"]
+              subprocess.run(command, capture_output=True)
+              try:
+                  process.wait(timeout=15)
+              except subprocess.TimeoutExpired:
+                  process.kill()
+
+
+          def start_relay(work, log):
+              key, conf = os.path.join(work, "AuthKey.p8"), os.path.join(work, "apns.conf")
+              made = subprocess.run(
+                  "openssl ecparam -name prime256v1 -genkey -noout | openssl pkcs8 -topk8 -nocrypt",
+                  shell=True, capture_output=True,
+              )
+              if made.returncode != 0:
+                  sys.exit("measure: openssl could not make the throwaway key")
+              with open(key, "wb") as file:
+                  file.write(made.stdout)
+              os.chmod(key, 0o600)
+              with open(conf, "w") as file:
+                  file.write("KEY_ID=MEASURE001\nTEAM_ID=MEASURE002\n")
+              relay = [BINARY, "--listen", f"127.0.0.1:{PORT}", "--key", key, "--config", conf, "--behind-proxy",
+                       "--apple-stand-in", f"http://127.0.0.1:{STAND_IN_PORT}"]
+              if not CGROUP:
+                  return subprocess.Popen(relay, stdout=log, stderr=log), None, "none"
+              limits = ["-p", f"MemoryMax={MEMORY_MAX // (1024 * 1024)}M", "-p", "MemorySwapMax=0"]
+              for kind in ("user", "system"):
+                  if kind == "user":
+                      command = ["systemd-run", "--user", "--scope", "--quiet", f"--unit={UNIT}"] + limits + ["--"] + relay
+                  else:
+                      command = (["sudo", "systemd-run", "--scope", "--quiet", f"--unit={UNIT}"] + limits
+                                 + ["--", "setpriv", f"--reuid={os.getuid()}", f"--regid={os.getgid()}", "--clear-groups", "--"]
+                                 + relay)
+                  process = subprocess.Popen(command, stdout=log, stderr=log)
+                  group = None
+                  for _ in range(50):
+                      if process.poll() is not None:
+                          break
+                      group = scope_cgroup(kind)
+                      if group and read(f"{group}/memory.max"):
+                          break
+                      time.sleep(0.1)
+                  limit = read(f"{group}/memory.max") if group else ""
+                  if process.poll() is None and limit == str(MEMORY_MAX):
+                      say(f"scope: kind={kind} memory.max={limit} memory.swap.max={read(f'{group}/memory.swap.max')}")
+                      return process, group, kind
+                  say(f"scope: kind={kind} unusable (exited={process.poll() is not None} memory.max={limit or 'absent'})")
+                  if process.poll() is None:
+                      stop_scope(kind, process)
+              sys.exit("measure: no systemd scope could set MemoryMax")
+
+
+          # Requests.
+          def address(family, index):
+              return f"{family}.{(index >> 16) & 255}.{(index >> 8) & 255}.{index & 255}"
+
+
+          def hexes(tag, index, length=64):
+              return f"{tag:02x}{index:0{length - 2}x}"
+
+
+          class Client:
+              def __init__(self):
+                  self.connection = None
+
+              def request(self, method, path, body=b"", headers=None, attempts=3):
+                  for _ in range(attempts):
+                      try:
+                          if self.connection is None:
+                              self.connection = http.client.HTTPConnection("127.0.0.1", PORT, timeout=60)
+                          self.connection.request(method, path, body=body, headers=headers or {})
+                          response = self.connection.getresponse()
+                          data = response.read()
+                          if response.getheader("connection", "").lower() == "close":
+                              self.connection.close()
+                              self.connection = None
+                          return response.status, data
+                      except (OSError, http.client.HTTPException):
+                          if self.connection is not None:
+                              self.connection.close()
+                          self.connection = None
+                  return 0, b""
+
+
+          def headers(caller, bearer=None):
+              result = {"Content-Type": "application/json", "X-Forwarded-For": caller}
+              if bearer:
+                  result["Authorization"] = f"Bearer {bearer}"
+              return result
+
+
+          def health(path):
+              status, data = Client().request("GET", path)
+              return json.loads(data) if status == 200 else {}
+
+
+          def answers(phase, counts):
+              listed = " ".join(f"{status or 'none'}={count}" for status, count in sorted(counts.items()))
+              say(f"answers: phase={phase} {listed}")
+
+
+          def run_many(phase, count, make, threads=16, report=True):
+              counts, lock, next_index = collections.Counter(), threading.Lock(), [0]
+
+              def worker():
+                  client, mine = Client(), collections.Counter()
+                  while True:
+                      with lock:
+                          index = next_index[0]
+                          next_index[0] += 1
+                      if index >= count:
+                          break
+                      method, path, body, sent = make(index)
+                      mine[client.request(method, path, body, sent)[0]] += 1
+                  with lock:
+                      counts.update(mine)
+
+              started = time.time()
+              workers = [threading.Thread(target=worker) for _ in range(threads)]
+              for thread in workers:
+                  thread.start()
+              for thread in workers:
+                  thread.join()
+              if report:
+                  answers(phase, counts)
+                  say(f"phase: {phase} requests={count} seconds={time.time() - started:.0f}")
+                  memory(phase)
+              return counts
+
+
+          def now():
+              return int(time.time())
+
+
+          def live_activity(token, event):
+              return json.dumps({"token": token, "event": event, "environment": "production", "timestamp": now(),
+                                 "contentState": {"counts": {"working": 1}}}).encode()
+
+
+          def alert(token, kind):
+              return json.dumps({"token": token, "kind": kind, "timestamp": now()}).encode()
+
+
+          # Memory.
+          class Memory:
+              process, group, kind, highest = None, None, "none", 0
+
+
+          def current():
+              if Memory.group:
+                  value = read(f"{Memory.group}/memory.current")
+                  return int(value) if value else 0
+              result = subprocess.run(["ps", "-o", "rss=", "-p", str(Memory.process.pid)], capture_output=True, text=True)
+              return int(result.stdout.strip() or 0) * 1024
+
+
+          def sampler():
+              while Memory.process.poll() is None:
+                  Memory.highest = max(Memory.highest, current())
+                  time.sleep(0.2)
+
+
+          def memory(phase):
+              if Memory.group:
+                  say(f"memory: phase={phase} current={current()} peak={read(f'{Memory.group}/memory.peak')} highest_sampled={Memory.highest}")
+              else:
+                  say(f"memory: phase={phase} rss={current()} highest_sampled={Memory.highest}")
+
+
+          # Phases.
+          def fill_gone():
+              """Both memories of dropped tokens to their caps, at the relay-wide rate (paced a little above it)."""
+
+              def family(phase, path, body, health_path, target, tag):
+                  client, counts, started, index, checked = Client(), collections.Counter(), time.time(), 0, 0.0
+                  while True:
+                      if time.time() >= checked:
+                          gone = health(health_path).get("goneTokens", 0)
+                          if gone >= target or time.time() - started > GONE_DEADLINE:
+                              break
+                          checked = time.time() + 2
+                      status, _ = client.request("POST", path, body(hexes(tag, index)), headers(address(tag, index // 50)))
+                      counts[status] += 1
+                      index += 1
+                      pause = started + index / 60 - time.time()
+                      if pause > 0:
+                          time.sleep(pause)
+                  answers(phase, counts)
+                  say(f"phase: {phase} goneTokens={gone} target={target} seconds={time.time() - started:.0f}")
+
+              threads = [
+                  threading.Thread(target=family, args=("gone-live-activity", "/live-activity/v1/send",
+                                                        lambda token: live_activity(token, "update"),
+                                                        "/live-activity/healthz", LA_GONE_TARGET, 12)),
+                  threading.Thread(target=family, args=("gone-push", "/push/v1/alert",
+                                                        lambda token: alert(token, "finished"),
+                                                        "/push/healthz", PUSH_GONE_TARGET, 14)),
+              ]
+              for thread in threads:
+                  thread.start()
+              for thread in threads:
+                  thread.join()
+              memory("gone")
+
+
+          def fill_tables():
+              """Every limit table and the store to its cap, within the 10 minutes before an idle key is forgotten."""
+              run_many("live-activity-address-token", LA_KEYS, lambda i: (
+                  "POST", "/live-activity/v1/send", live_activity(hexes(0x11, i), "update"), headers(address(11, i))))
+              run_many("live-activity-start-token", LA_KEYS, lambda i: (
+                  "POST", "/live-activity/v1/send", live_activity(hexes(0x12, i), "start"), headers(address(11, i))))
+              run_many("push-address-alert-token", PUSH_KEYS, lambda i: (
+                  "POST", "/push/v1/alert", alert(hexes(0x13, i), "finished"), headers(address(13, i))))
+              run_many("push-background-token", PUSH_KEYS, lambda i: (
+                  "POST", "/push/v1/alert", alert(hexes(0x14, i), "background"), headers(address(13, i))))
+              run_many("push-widget-token", PUSH_KEYS, lambda i: (
+                  "POST", "/push/v1/widgets", json.dumps({"token": hexes(0x15, i)}).encode(), headers(address(13, i))))
+              # Store: each address puts a new mailbox id and takes it (address, new-id and mailbox-id tables), in
+              # batches below the entry cap, then the first STORE_ENTRIES addresses put one snapshot each, sized so
+              # entries and bytes reach both caps.
+              batch, put, taken = 1000, collections.Counter(), collections.Counter()
+              for first in range(0, PUSH_KEYS, batch):
+                  size = min(batch, PUSH_KEYS - first)
+                  put += run_many("store-mailbox-put", size, lambda i: (
+                      "PUT", "/push/v1/mailbox", hexes(0x17, first + i, 512).encode(),
+                      headers(address(15, first + i), hexes(0x16, first + i))), report=False)
+                  taken += run_many("store-mailbox-take", size, lambda i: (
+                      "GET", "/push/v1/mailbox", b"", headers(address(15, first + i), hexes(0x16, first + i))), report=False)
+              answers("store-mailbox-put", put)
+              answers("store-mailbox-take", taken)
+              memory("store-mailbox")
+              base, extra = divmod(STORE_BYTES, STORE_ENTRIES)
+              run_many("store-snapshot-put", STORE_ENTRIES, lambda i: (
+                  "PUT", "/push/v1/snapshot", b"s" * (base + (1 if i < extra else 0)), headers(address(15, i), hexes(0x18, i))))
+              run_many("store-full-probe", 1, lambda i: (
+                  "PUT", "/push/v1/snapshot", b"s", headers(address(15, STORE_ENTRIES), hexes(0x19, i))), threads=1)
+              live, push = health("/live-activity/healthz"), health("/push/healthz")
+              say(f"health: live-activity goneTokens={live.get('goneTokens')} sent={live.get('sent')} "
+                  f"rateLimited={live.get('rateLimited')} appleErrors={live.get('appleErrors')}")
+              say(f"health: push goneTokens={push.get('goneTokens')} snapshots={push.get('snapshots')} "
+                  f"mailboxEntries={push.get('mailboxEntries')} storeBytes={push.get('storeBytes')} "
+                  f"storeFull={push.get('storeFull')} rateLimited={push.get('rateLimited')}")
+
+
+          def raw_status(sock, limit):
+              sock.settimeout(limit)
+              data = b""
+              try:
+                  while b"\r\n" not in data:
+                      chunk = sock.recv(4096)
+                      if not chunk:
+                          return 0
+                      data += chunk
+              except OSError:
+                  return 0
+              parts = data.split(b" ", 2)
+              return int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else 0
+
+
+          def raw_head(caller, length):
+              return (f"POST /push/v1/alert HTTP/1.1\r\nHost: relay\r\nContent-Type: application/json\r\n"
+                      f"X-Forwarded-For: {caller}\r\nContent-Length: {length}\r\n\r\n").encode()
+
+
+          def slow_bodies():
+              """Every place held by a body one byte short of the largest, then 64 more requests (headers only: an
+              answer to them proves their body was not awaited), then the 408s."""
+              started, held = time.time(), []
+              for i in range(BODY_READS):
+                  sock = socket.create_connection(("127.0.0.1", PORT))
+                  sock.sendall(raw_head(address(16, i), PUSH_BODY) + b"a" * (PUSH_BODY - 1))
+                  held.append(sock)
+              time.sleep(1)
+              memory("slow-held")
+              extra = collections.Counter()
+              for i in range(64):
+                  with socket.create_connection(("127.0.0.1", PORT)) as sock:
+                      sock.sendall(raw_head(address(16, BODY_READS + i), PUSH_BODY))
+                      extra[raw_status(sock, 5)] += 1
+              answers("slow-extra", extra)
+              slow = collections.Counter()
+              for sock in held:
+                  slow[raw_status(sock, BODY_READ_TIME + 10)] += 1
+                  sock.close()
+              answers("slow-held", slow)
+              say(f"phase: slow seconds={time.time() - started:.0f}")
+              memory("slow-done")
+
+
+          def parallel_bodies(rounds=10):
+              """The quota plus 64 requests at once with the largest body, ten times."""
+              width, counts, lock = BODY_READS + 64, collections.Counter(), threading.Lock()
+              barrier, started = threading.Barrier(width), time.time()
+              body = b"a" * PUSH_BODY
+
+              def worker(k):
+                  client, mine = Client(), collections.Counter()
+                  for _ in range(rounds):
+                      barrier.wait()
+                      # One attempt: a request refused unread (503) may lose its connection before the answer is
+                      # read; it counts as "none" rather than being sent again.
+                      mine[client.request("POST", "/push/v1/alert", body, headers(address(17, k)), attempts=1)[0]] += 1
+                  with lock:
+                      counts.update(mine)
+
+              workers = [threading.Thread(target=worker, args=(k,)) for k in range(width)]
+              for thread in workers:
+                  thread.start()
+              for thread in workers:
+                  thread.join()
+              answers("parallel", counts)
+              say(f"phase: parallel width={width} rounds={rounds} seconds={time.time() - started:.0f}")
+              memory("parallel")
+
+
+          KEEP = {"reason", "scope", "status", "kind", "event", "env"}
+
+
+          def log_class(line):
+              if line.startswith("configured: the key loaded;") or line == f"listening on 127.0.0.1:{PORT}":
+                  return line
+              words, pairs = [], False
+              for word in line.split():
+                  if "=" in word:
+                      pairs = True
+                      key, value = word.split("=", 1)
+                      if key in KEEP and re.fullmatch(r"[A-Za-z0-9-]{1,40}", value):
+                          words.append(word)
+                  elif not pairs and re.fullmatch(r"[a-z]{1,20}", word):
+                      words.append(word)
+              return " ".join(words) or "other"
+
+
+          def main():
+              soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+              resource.setrlimit(resource.RLIMIT_NOFILE, (min(hard, 8192) if hard > 0 else 8192, hard))
+              say(f"config: body_reads={BODY_READS} body_read_time={BODY_READ_TIME}s push_body={PUSH_BODY} "
+                  f"la_keys={LA_KEYS} la_gone={LA_GONE_TARGET} push_keys={PUSH_KEYS} push_gone={PUSH_GONE_TARGET} "
+                  f"store_entries={STORE_ENTRIES} store_bytes={STORE_BYTES} cgroup={CGROUP} dry_run={DRY}")
+              stand_in()
+              work = tempfile.mkdtemp(prefix="relay-measure-", dir=os.environ.get("MEASURE_TMP") or None)
+              log_path = os.path.join(work, "relay.log")
+              with open(log_path, "wb") as log:
+                  Memory.process, Memory.group, Memory.kind = start_relay(work, log)
+              for _ in range(100):
+                  if health("/live-activity/healthz").get("configured"):
+                      break
+                  time.sleep(0.1)
+              else:
+                  stop(work)
+                  sys.exit("measure: the relay did not come up configured")
+              threading.Thread(target=sampler, daemon=True).start()
+              memory("start")
+              fill_gone()
+              fill_tables()
+              slow_bodies()
+              parallel_bodies()
+              alive = Memory.process.poll() is None and health("/push/healthz").get("ok") is True
+              events = read(f"{Memory.group}/memory.events").replace("\n", " ") if Memory.group else ""
+              killed = re.search(r"oom_kill (\d+)", events)
+              memory("end")
+              if Memory.group:
+                  say(f"cgroup: memory.peak={read(f'{Memory.group}/memory.peak')} "
+                      f"memory.swap.peak={read(f'{Memory.group}/memory.swap.peak') or 'absent'} events: {events}")
+              say(f"result: alive={'yes' if alive else 'no'} oom_kill={killed.group(1) if killed else 'n/a'} "
+                  f"exit={Memory.process.poll()} scope={Memory.kind} highest_sampled={Memory.highest}")
+              stop(work)
+
+
+          def stop(work):
+              if Memory.kind in ("user", "system"):
+                  stop_scope(Memory.kind, Memory.process)
+              else:
+                  Memory.process.terminate()
+                  Memory.process.wait(timeout=15)
+              classes = collections.Counter()
+              with open(os.path.join(work, "relay.log"), errors="replace") as log:
+                  for line in log:
+                      classes[log_class(line.strip())] += 1
+              for name, count in sorted(classes.items()):
+                  say(f"relay-log: count={count} {name}")
+              for name in ("AuthKey.p8", "apns.conf", "relay.log"):
+                  os.remove(os.path.join(work, name))
+              os.rmdir(work)
+
+
+          main()
